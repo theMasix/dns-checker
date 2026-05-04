@@ -8,6 +8,7 @@
 # Configuration
 TIMEOUT=2
 ITERATIONS=2
+MAX_CONCURRENT=10
 OUTPUT_FILE="dns_benchmark_report_$(date +%Y%m%d_%H%M%S).txt"
 
 # Colors for output
@@ -26,8 +27,9 @@ usage() {
     echo "Options:"
     echo "  -d, --domains FILE      File containing domains (one per line)"
     echo "  -s, --servers FILE      File containing DNS servers (one per line)"
-    echo "  -t, --timeout SECONDS   Query timeout (default: 5)"
-    echo "  -i, --iterations NUM    Number of test iterations per domain (default: 3)"
+    echo "  -t, --timeout SECONDS   Query timeout (default: 2)"
+    echo "  -i, --iterations NUM    Number of test iterations per domain (default: 2)"
+    echo "  -c, --concurrency NUM   Max concurrent DNS server tests (default: 10)"
     echo "  -o, --output FILE       Output report file"
     echo "  -h, --help              Show this help message"
     echo ""
@@ -55,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -i|--iterations)
             ITERATIONS="$2"
+            shift 2
+            ;;
+        -c|--concurrency)
+            MAX_CONCURRENT="$2"
             shift 2
             ;;
         -o|--output)
@@ -107,6 +113,23 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$DNS_FILE"
 
 ################################################################################
+# Temp files and cleanup
+################################################################################
+RESULTS_FILE=$(mktemp)
+STATS_FILE=$(mktemp)
+WORK_DIR=$(mktemp -d)
+SEM_FIFO="$WORK_DIR/sem.fifo"
+mkfifo "$SEM_FIFO"
+exec 9<>"$SEM_FIFO"
+
+trap 'rm -f "$RESULTS_FILE" "$STATS_FILE"; rm -rf "$WORK_DIR"' EXIT
+
+# Pre-fill semaphore with MAX_CONCURRENT tokens
+for ((i=0; i<MAX_CONCURRENT; i++)); do
+    printf "x" >&9
+done
+
+################################################################################
 # Helper Functions
 ################################################################################
 
@@ -115,12 +138,13 @@ timestamp() {
     date "+%Y-%m-%d %H:%M:%S"
 }
 
-# Resolve domain using dig (returns time in ms or "FAIL")
+# Resolve domain using dig (returns IP or empty on failure)
 resolve_with_dig() {
     local domain=$1
     local dns=$2
-    
-    local result=$(dig +short +time="$TIMEOUT" +tries=1 "@$dns" "$domain" A 2>/dev/null)
+
+    local result
+    result=$(dig +short +time="$TIMEOUT" +tries=1 "@$dns" "$domain" A 2>/dev/null)
     if [[ -n "$result" ]]; then
         echo "$result"
         return 0
@@ -128,90 +152,29 @@ resolve_with_dig() {
     return 1
 }
 
-# Get query time using dig
+# Returns query time in ms, or "FAIL"
 get_query_time() {
     local domain=$1
     local dns=$2
-    
-    # Use dig with +stats to get query time
-    local dig_output=$(dig +time="$TIMEOUT" +tries=1 "@$dns" "$domain" A 2>&1)
-    
-    # Check if query was successful
+
+    local dig_output
+    dig_output=$(dig +time="$TIMEOUT" +tries=1 "@$dns" "$domain" A 2>&1)
+
     if echo "$dig_output" | grep -qi "timed out\|connection refused\|no servers could be reached\|SERVFAIL"; then
         echo "FAIL"
         return 1
     fi
-    
-    # Extract query time from dig stats
-    local query_time=$(echo "$dig_output" | grep "Query time:" | awk '{print $4}')
-    
+
+    local query_time
+    query_time=$(echo "$dig_output" | grep "Query time:" | awk '{print $4}')
+
     if [[ -n "$query_time" ]]; then
         echo "$query_time"
         return 0
     fi
-    
+
     echo "FAIL"
     return 1
-}
-
-# Get detailed query stats
-get_query_stats() {
-    local domain=$1
-    local dns=$2
-    
-    local dig_output=$(dig +time="$TIMEOUT" +tries=1 "@$dns" "$domain" A +stats 2>&1)
-    
-    # Check for errors
-    if echo "$dig_output" | grep -qi "timed out\|connection refused\|no servers could be reached"; then
-        echo "FAIL"
-        return 1
-    fi
-    
-    local query_time=$(echo "$dig_output" | grep "Query time:" | awk '{print $4}')
-    local query_size=$(echo "$dig_output" | grep "Msg size" | awk '{print $NF}')
-    local status=$(echo "$dig_output" | grep "STATUS:" | awk '{print $2}')
-    
-    if [[ -n "$query_time" ]]; then
-        echo "${query_time}|${query_size}|${status}"
-        return 0
-    fi
-    
-    echo "FAIL|FAIL|FAIL"
-    return 1
-}
-
-# Calculate average
-calc_avg() {
-    local sum=0
-    local count=0
-    for val in "$@"; do
-        if [[ "$val" != "FAIL" ]] && [[ "$val" =~ ^[0-9]+$ ]]; then
-            sum=$((sum + val))
-            count=$((count + 1))
-        fi
-    done
-    if [[ $count -gt 0 ]]; then
-        echo $((sum / count))
-    else
-        echo "N/A"
-    fi
-}
-
-################################################################################
-# Print progress bar
-################################################################################
-print_progress() {
-    local current=$1
-    local total=$2
-    local width=50
-    local percentage=$((current * 100 / total))
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
-    
-    printf "\r${BLUE}["
-    printf "%${filled}s" | tr ' ' '='
-    printf "%${empty}s" | tr ' ' '-'
-    printf "] %3d%%${NC}" "$percentage"
 }
 
 ################################################################################
@@ -220,93 +183,118 @@ print_progress() {
 print_banner() {
     cat << 'EOF'
 
-    ██████╗  █████╗ ████████╗ █████╗ 
+    ██████╗  █████╗ ████████╗ █████╗
     ██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗
     ██║  ██║███████║   ██║   ███████║
     ██║  ██║██╔══██║   ██║   ██╔══██║
     ██████╔╝██║  ██║   ██║   ██║  ██║
     ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝
-                                        
+
     DNS Benchmark Tool v1.0
 EOF
 }
 
 ################################################################################
-# Main Benchmark Function
+# Per-DNS worker function (runs in background subshell)
 ################################################################################
-RESULTS_FILE=$(mktemp)
-STATS_FILE=$(mktemp)
-trap 'rm -f "$RESULTS_FILE" "$STATS_FILE"' EXIT
+test_dns_server() {
+    local dns=$1
+    local result_file=$2
+    local stat_file=$3
 
-run_benchmark() {
-    local total_tests=$((${#DOMAINS[@]} * ${#DNS_SERVERS[@]} * ITERATIONS))
-    local current_test=0
-    local start_time=$(date +%s)
+    local dns_success=0
+    local dns_total=0
+    local all_times=()
 
-    echo -e "${YELLOW}Starting DNS benchmark...${NC}"
-    echo ""
+    for domain in "${DOMAINS[@]}"; do
+        [[ -z "$domain" ]] && continue
 
-    # Test each DNS server
-    for dns in "${DNS_SERVERS[@]}"; do
-        echo -e "${GREEN}Testing DNS server: $dns${NC}"
+        for ((iter=1; iter<=ITERATIONS; iter++)); do
+            local query_time
+            query_time=$(get_query_time "$domain" "$dns")
 
-        local dns_success=0
-        local dns_total=0
-        local all_times=()
-
-        for domain in "${DOMAINS[@]}"; do
-            [[ -z "$domain" ]] && continue
-
-            for ((iter=1; iter<=ITERATIONS; iter++)); do
-                current_test=$((current_test + 1))
-                print_progress $current_test $total_tests
-
-                local query_time=$(get_query_time "$domain" "$dns")
-
-                if [[ "$query_time" != "FAIL" ]]; then
-                    dns_success=$((dns_success + 1))
-                    all_times+=("$query_time")
-                fi
-                echo "${dns}|${domain}|${iter}|${query_time}" >> "$RESULTS_FILE"
-
-                dns_total=$((dns_total + 1))
-
-                sleep 0.01
-            done
+            if [[ "$query_time" != "FAIL" ]]; then
+                dns_success=$((dns_success + 1))
+                all_times+=("$query_time")
+            fi
+            echo "${dns}|${domain}|${iter}|${query_time}" >> "$result_file"
+            dns_total=$((dns_total + 1))
         done
-
-        # Calculate DNS server statistics
-        if [[ ${#all_times[@]} -gt 0 ]]; then
-            local success_rate=$((dns_success * 100 / dns_total))
-
-            local min_val=${all_times[0]}
-            local max_val=${all_times[0]}
-            local sum=0
-
-            for t in "${all_times[@]}"; do
-                ((t < min_val)) && min_val=$t
-                ((t > max_val)) && max_val=$t
-                sum=$((sum + t))
-            done
-
-            local avg_val=$((sum / ${#all_times[@]}))
-            echo "${dns}|${success_rate}|${avg_val}|${min_val}|${max_val}" >> "$STATS_FILE"
-        else
-            echo "${dns}|0|N/A|N/A|N/A" >> "$STATS_FILE"
-        fi
-
-        local avg_disp=$(tail -1 "$STATS_FILE" | cut -d'|' -f3)
-        local min_disp=$(tail -1 "$STATS_FILE" | cut -d'|' -f4)
-        local max_disp=$(tail -1 "$STATS_FILE" | cut -d'|' -f5)
-        local sr_disp=$(tail -1 "$STATS_FILE" | cut -d'|' -f2)
-        echo ""
-        echo -e "  ${GREEN}Success rate: ${sr_disp}% | Avg: ${avg_disp}ms | Min: ${min_disp}ms | Max: ${max_disp}ms${NC}"
-        echo ""
     done
 
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
+    if [[ ${#all_times[@]} -gt 0 ]]; then
+        local success_rate=$((dns_success * 100 / dns_total))
+        local min_val=${all_times[0]}
+        local max_val=${all_times[0]}
+        local sum=0
+        for t in "${all_times[@]}"; do
+            ((t < min_val)) && min_val=$t
+            ((t > max_val)) && max_val=$t
+            sum=$((sum + t))
+        done
+        local avg_val=$((sum / ${#all_times[@]}))
+        echo "${dns}|${success_rate}|${avg_val}|${min_val}|${max_val}" > "$stat_file"
+    else
+        echo "${dns}|0|N/A|N/A|N/A" > "$stat_file"
+    fi
+}
 
+################################################################################
+# Main Benchmark Function
+################################################################################
+run_benchmark() {
+    local start_time
+    start_time=$(date +%s)
+    local dns_count=${#DNS_SERVERS[@]}
+
+    echo -e "${YELLOW}Starting DNS benchmark (${dns_count} servers, concurrency=${MAX_CONCURRENT})...${NC}"
+    echo ""
+
+    # Assign indexed temp file pairs (bash 3.2-compatible, no associative arrays)
+    local result_files=()
+    local stat_files=()
+    local i
+    for ((i=0; i<${#DNS_SERVERS[@]}; i++)); do
+        result_files[$i]=$(mktemp "$WORK_DIR/result.XXXXXX")
+        stat_files[$i]=$(mktemp "$WORK_DIR/stat.XXXXXX")
+    done
+
+    # Dispatch workers with semaphore-controlled concurrency
+    for ((i=0; i<${#DNS_SERVERS[@]}; i++)); do
+        local dns="${DNS_SERVERS[$i]}"
+        read -r -n1 -u9 _token  # acquire slot (blocks when MAX_CONCURRENT are running)
+        echo -e "${BLUE}  → Starting: $dns${NC}"
+        (
+            test_dns_server "$dns" "${result_files[$i]}" "${stat_files[$i]}"
+            printf "x" >&9  # release slot
+        ) &
+    done
+
+    # Wait for all workers to finish
+    wait
+
+    echo ""
+
+    # Merge results in original server order and print summaries
+    for ((i=0; i<${#DNS_SERVERS[@]}; i++)); do
+        local dns="${DNS_SERVERS[$i]}"
+        cat "${result_files[$i]}" >> "$RESULTS_FILE"
+        cat "${stat_files[$i]}"   >> "$STATS_FILE"
+
+        local stats
+        stats=$(cat "${stat_files[$i]}")
+        local sr avg min max
+        sr=$(echo  "$stats" | cut -d'|' -f2)
+        avg=$(echo "$stats" | cut -d'|' -f3)
+        min=$(echo "$stats" | cut -d'|' -f4)
+        max=$(echo "$stats" | cut -d'|' -f5)
+        echo -e "  ${GREEN}$dns  →  success=${sr}%  avg=${avg}ms  min=${min}ms  max=${max}ms${NC}"
+    done
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    echo ""
     echo -e "${GREEN}Benchmark completed in ${duration}s${NC}"
 }
 
@@ -327,6 +315,7 @@ generate_report() {
         echo "DNS servers tested: ${#DNS_SERVERS[@]}"
         echo "Iterations per domain: $ITERATIONS"
         echo "Timeout per query: ${TIMEOUT}s"
+        echo "Concurrency: $MAX_CONCURRENT"
         echo ""
 
         # DNS Server Rankings
@@ -369,8 +358,8 @@ generate_report() {
                 local ip="N/A"
                 local time="N/A"
 
-                # Get first successful result from results file
-                local first_ok=$(grep "^${dns}|${domain}|" "$RESULTS_FILE" | grep -v "|FAIL$" | head -1)
+                local first_ok
+                first_ok=$(grep "^${dns}|${domain}|" "$RESULTS_FILE" | grep -v "|FAIL$" | head -1)
                 if [[ -n "$first_ok" ]]; then
                     status="OK"
                     time=$(echo "$first_ok" | cut -d'|' -f4)" ms"
@@ -387,15 +376,15 @@ generate_report() {
         echo "───────────────────────────────────────────────────────────────────────────────"
         echo ""
 
-        local best_dns=$(head -1 "$SORTED_FILE" | cut -d'|' -f2)
-        local best_avg=$(head -1 "$SORTED_FILE" | cut -d'|' -f4)
-        local best_success=$(head -1 "$SORTED_FILE" | cut -d'|' -f3)
+        local best_dns best_avg best_success
+        best_dns=$(head -1     "$SORTED_FILE" | cut -d'|' -f2)
+        best_avg=$(head -1     "$SORTED_FILE" | cut -d'|' -f4)
+        best_success=$(head -1 "$SORTED_FILE" | cut -d'|' -f3)
         echo "Best DNS Server: ${best_dns:-N/A}"
         echo "Average Response Time: ${best_avg:-N/A} ms"
         echo "Success Rate: ${best_success:-0}%"
         echo ""
 
-        # Recommendation
         echo "───────────────────────────────────────────────────────────────────────────────"
         echo "                              RECOMMENDATION"
         echo "───────────────────────────────────────────────────────────────────────────────"
@@ -429,25 +418,25 @@ generate_report() {
 main() {
     print_banner
     echo ""
-    
+
     echo -e "${BLUE}Configuration:${NC}"
-    echo "  Domains file: $DOMAINS_FILE"
+    echo "  Domains file:    $DOMAINS_FILE"
     echo "  DNS servers file: $DNS_FILE"
-    echo "  Timeout: ${TIMEOUT}s"
-    echo "  Iterations: $ITERATIONS"
+    echo "  Timeout:         ${TIMEOUT}s"
+    echo "  Iterations:      $ITERATIONS"
+    echo "  Concurrency:     $MAX_CONCURRENT"
     echo ""
-    
-    # Check for required tools
+
     if ! command -v dig &> /dev/null; then
         echo -e "${RED}Error: 'dig' is required but not installed.${NC}"
         echo "Install with: apt-get install dnsutils (Debian/Ubuntu) or brew install bind (macOS)"
         exit 1
     fi
-    
+
     if ! command -v bc &> /dev/null; then
         echo -e "${YELLOW}Warning: 'bc' not found. Score calculation may be limited.${NC}"
     fi
-    
+
     run_benchmark
     generate_report
 }
